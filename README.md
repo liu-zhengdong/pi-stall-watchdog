@@ -15,7 +15,7 @@ provider 的流式响应会停摆：连接还活着，但长时间不出内容�
 ## 安装
 
 ```sh
-pi install git:github.com/liu-zhengdong/pi-stall-watchdog@v0.1.0
+pi install git:github.com/liu-zhengdong/pi-stall-watchdog@v0.1.1
 ```
 
 装完新开的会话自动生效，已经在跑的会话不受影响。
