@@ -1,6 +1,6 @@
 {
   "name": "pi-stall-watchdog",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Abort and retry stalled model streams in Pi",
   "type": "module",
   "keywords": [
@@ -30,5 +30,13 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
   }
 }
