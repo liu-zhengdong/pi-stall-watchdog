@@ -50,6 +50,10 @@ pi install git:github.com/liu-zhengdong/pi-stall-watchdog@v0.1.1
 
 只在「一个流事件都收不到」时触发。如果某个 provider 停摆时仍在发事件，这个看门狗看不出来。
 
+**工具结果续接处的停摆，重试目前会被吞掉**（[#3](https://github.com/liu-zhengdong/pi-stall-watchdog/issues/3)）。Pi 确实会重试，但 claude-bridge 把重发请求认成了「用户按 ESC 后的孤儿工具结果」，返回一条零 token 的空消息；Pi 看到 `stopReason: "stop"` 就当重试成功，轮次正常结束。用户侧表现为报错后停住，需要手动输入一句才能继续。
+
+停摆发生在用户消息之后（没有待续接的工具结果）时不受影响，重试正常。
+
 ## 测试
 
 ```sh
