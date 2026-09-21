@@ -1,0 +1,34 @@
+{
+  "name": "pi-stall-watchdog",
+  "version": "0.1.0",
+  "description": "Abort and retry stalled model streams in Pi",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/liu-zhengdong/pi-stall-watchdog.git"
+  },
+  "homepage": "https://github.com/liu-zhengdong/pi-stall-watchdog#readme",
+  "bugs": {
+    "url": "https://github.com/liu-zhengdong/pi-stall-watchdog/issues"
+  },
+  "license": "MIT",
+  "scripts": {
+    "test": "./test/run.sh"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
