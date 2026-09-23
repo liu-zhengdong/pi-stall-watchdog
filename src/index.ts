@@ -18,6 +18,12 @@
 // claude-bridge 而言这条路和用户按 ESC 完全一样：它会标记 CC 会话需要重建，
 // 下一次调用从 Pi 的历史重建。代价是丢一次 prompt cache，所以阈值要保守。
 //
+// 拒答恢复：Claude Code 的 safeguards 会误拦正常请求（错误文本含
+// "safeguards flagged this message"），pi-ai 不重试这类错误，会话停住。
+// 识别后等整轮停稳，按开关决定是否自动换新会话并发送「继续上次的任务」：
+//   PI_STALL_WATCHDOG_RECOVER  默认只对交互会话（hasUI）恢复；设 1 无 UI 也
+//                              恢复；设 0 关闭。不受 PI_STALL_WATCHDOG_MS 影响。
+//
 // 配置：
 //   PI_STALL_WATCHDOG_MS     无事件多少毫秒判定停摆，默认 120000，设 0 关闭
 //   PI_STALL_WATCHDOG_DEBUG  设为 1 时把包装和触发记录到
@@ -27,7 +33,7 @@ import { appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const DEFAULT_STALL_MS = 120_000;
 const WRAPPED = Symbol.for("pi-stall-watchdog:wrapped");
@@ -217,7 +223,107 @@ function patchProvider(ctx: ExtensionContext, providerId: string | undefined): v
 	}
 }
 
+// 拒答恢复：Claude Code 的 safeguards 偶尔把正常请求误判成违规（多为误报），
+// 错误文本含 "safeguards flagged this message"。pi-ai 不重试这类错误，轮次
+// 结束、会话停住。这里在整轮完全停稳后换一个新会话：写一条接续说明，再发送
+// 「继续上次的任务」，让模型从干净上下文继续。
+//
+// 环境变量：
+//   PI_STALL_WATCHDOG_RECOVER  默认只对交互会话（hasUI）自动恢复；
+//                              设 1 无 UI 也恢复；设 0 关闭。
+
+const RECOVERY_COMMAND = "recover";
+const RECOVERY_NOTE_TYPE = "stall-watchdog-recovery";
+const RECOVERY_MARK = /safeguards flagged this message/i;
+/** 两次恢复之间的冷却，防止新会话又被拦下时连环换会话。 */
+export const RECOVERY_COOLDOWN_MS = 5 * 60_000;
+
+type RecoveryState = {
+	/** 出现了拒答错误，等整轮停稳后处理。 */
+	pending: boolean;
+	/** 上次自动恢复的时刻；换会话后仍要生效。 */
+	lastAt: number;
+};
+
+// 状态放 globalThis：会话切换后扩展实例可能重建，冷却与 pending 都要活下来。
+const RECOVERY_STATE = Symbol.for("pi-stall-watchdog:recovery");
+
+function recoveryState(): RecoveryState {
+	const host = globalThis as Record<PropertyKey, unknown>;
+	let state = host[RECOVERY_STATE] as RecoveryState | undefined;
+	if (!state) {
+		state = { pending: false, lastAt: 0 };
+		host[RECOVERY_STATE] = state;
+	}
+	return state;
+}
+
+/** 该 assistant 消息是不是 Claude Code 的 safeguards 拒答。 */
+export function isSafeguardRefusal(message: any): boolean {
+	return (
+		message?.role === "assistant" &&
+		message.stopReason === "error" &&
+		typeof message.errorMessage === "string" &&
+		RECOVERY_MARK.test(message.errorMessage)
+	);
+}
+
+/** 现在要不要自动恢复：开关、UI 条件与冷却。 */
+export function shouldAutoRecover(opts: { hasUI: boolean; env: string | undefined; now: number; lastAt: number }): boolean {
+	if (opts.env === "0") return false;
+	if (!opts.hasUI && opts.env !== "1") return false;
+	return opts.now - opts.lastAt >= RECOVERY_COOLDOWN_MS;
+}
+
+/** 拒答恢复的注册：检测（message_end）、派发（agent_settled）与命令本体。 */
+function installRefusalRecovery(pi: ExtensionAPI): void {
+	pi.on("message_end", (event: { message?: any }) => {
+		if (!isSafeguardRefusal(event?.message)) return;
+		recoveryState().pending = true;
+		log(`safeguards refusal seen: ${String(event.message?.errorMessage).slice(0, 120)}`);
+	});
+
+	// 派发必须等整轮停稳；newSession 只能在命令上下文里调，所以这里把
+	// 一个斜杠命令当用户消息发出去，由 /recover 本体完成切换。
+	pi.on("agent_settled", (_event: unknown, ctx: ExtensionContext) => {
+		const state = recoveryState();
+		if (!state.pending) return;
+		state.pending = false;
+		const env = process.env.PI_STALL_WATCHDOG_RECOVER;
+		const now = Date.now();
+		if (!shouldAutoRecover({ hasUI: ctx.hasUI, env, now, lastAt: state.lastAt })) {
+			log(`refusal recovery skipped (hasUI=${ctx.hasUI}, env=${env ?? ""})`);
+			return;
+		}
+		state.lastAt = now;
+		log("refusal recovery: dispatching /recover");
+		pi.sendUserMessage(`/${RECOVERY_COMMAND}`, { expandPromptTemplates: true });
+	});
+
+	// 手动执行同样的切换：命令上下文里才有 newSession。
+	pi.registerCommand(RECOVERY_COMMAND, {
+		description: "safeguards 误拦后：开一个新会话（带接续说明）并发送「继续上次的任务」",
+		handler: async (_args: unknown, ctx: ExtensionCommandContext) => {
+			await ctx.waitForIdle();
+			const parent = ctx.sessionManager.getSessionFile();
+			const note = parent
+				? `上一个会话在 Claude Code 的 safeguards 误拦处中断（多为误报），已在这里继续。\n原会话文件保留在 ${parent}。`
+				: "上一个会话在 Claude Code 的 safeguards 误拦处中断（多为误报），已在这里继续。";
+			await ctx.newSession({
+				...(parent ? { parentSession: parent } : {}),
+				withSession: async (rctx) => {
+					await rctx.sendMessage({ customType: RECOVERY_NOTE_TYPE, content: note, display: true }, { triggerTurn: false });
+					await rctx.sendUserMessage("继续上次的任务");
+				},
+			});
+		},
+	});
+}
+
 export default function (pi: ExtensionAPI) {
+	// 拒答恢复独立于停摆检测（开关是 PI_STALL_WATCHDOG_RECOVER）。
+	installRefusalRecovery(pi);
+
 	if (stallMs <= 0) return;
 
 	// session_start 覆盖开局；turn_start 覆盖 registry 重建 provider 的情况；
