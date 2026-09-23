@@ -1,6 +1,6 @@
 {
   "name": "pi-stall-watchdog",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Abort and retry stalled model streams in Pi",
   "type": "module",
   "keywords": [

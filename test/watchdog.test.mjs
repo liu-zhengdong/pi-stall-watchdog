@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
-import { buildStallMessage, withStallWatchdog } from "../src/index.ts";
+import watchdogExtension, { RECOVERY_COOLDOWN_MS, buildStallMessage, isSafeguardRefusal, shouldAutoRecover, withStallWatchdog } from "../src/index.ts";
 
 // 看门狗的计时器是 unref 的（不该让 pi 进程为它活着），测试进程里没有别的
 // 活动句柄，事件循环会直接排空。真实运行时底层请求自带 socket/子进程句柄，
@@ -148,4 +148,98 @@ test("反向：几种不该被当成可重试的文本确实不可重试", () =>
 	}
 	// aborted 永远不重试，这正是看门狗不能发 aborted 的原因
 	assert.equal(isRetryableAssistantError({ ...partial(), stopReason: "aborted", errorMessage: "Provider stream timeout" }), false);
+});
+
+test("拒答判定：只认 safeguards flagged 文本", () => {
+	const refusal = partial({ stopReason: "error", errorMessage: "API Error: Opus 5 (1M context)'s safeguards flagged this message (https://www.anthropic.com/legal/aup)." });
+	assert.equal(isSafeguardRefusal(refusal), true);
+	assert.equal(isSafeguardRefusal(partial({ stopReason: "error", errorMessage: "Provider stream timeout: no stream events for 120s (pi stall watchdog)" })), false);
+	assert.equal(isSafeguardRefusal(partial({ stopReason: "error", errorMessage: "quota exceeded" })), false);
+	assert.equal(isSafeguardRefusal(partial({ stopReason: "error" })), false);
+	assert.equal(isSafeguardRefusal(partial()), false);
+	assert.equal(isSafeguardRefusal({ role: "user", content: [] }), false);
+	assert.equal(isSafeguardRefusal(undefined), false);
+});
+
+test("恢复决策：开关、hasUI 与冷却", () => {
+	const now = 1_000_000_000_000;
+	const base = { hasUI: true, env: undefined, now, lastAt: 0 };
+	assert.equal(shouldAutoRecover(base), true);
+	assert.equal(shouldAutoRecover({ ...base, hasUI: false }), false, "默认无 UI 不恢复");
+	assert.equal(shouldAutoRecover({ ...base, hasUI: false, env: "1" }), true, "设 1 后无 UI 也恢复");
+	assert.equal(shouldAutoRecover({ ...base, env: "0" }), false, "设 0 关闭");
+	assert.equal(shouldAutoRecover({ ...base, lastAt: now - 1 }), false, "冷却内不恢复");
+	assert.equal(shouldAutoRecover({ ...base, lastAt: now - RECOVERY_COOLDOWN_MS }), true, "冷却边界可恢复");
+});
+
+test("终态回调：拒答在停稳时派发 /recover，普通消息不派发", () => {
+	delete globalThis[Symbol.for("pi-stall-watchdog:recovery")];
+	const savedEnv = process.env.PI_STALL_WATCHDOG_RECOVER;
+	delete process.env.PI_STALL_WATCHDOG_RECOVER;
+	try {
+		const handlers = {};
+		const sent = [];
+		const fakePi = {
+			on: (name, handler) => { (handlers[name] ??= []).push(handler); },
+			registerCommand: () => {},
+			sendUserMessage: (content, options) => { sent.push({ content, options }); },
+		};
+		watchdogExtension(fakePi);
+		const fireMessage = (message) => { for (const handler of handlers.message_end ?? []) handler({ message }, {}); };
+		const settle = (ctx = { hasUI: true }) => { for (const handler of handlers.agent_settled ?? []) handler({}, ctx); };
+		const refusal = () => partial({ stopReason: "error", errorMessage: "API Error: Opus 5 (1M context)'s safeguards flagged this message (https://www.anthropic.com/legal/aup)." });
+
+		fireMessage(partial({ content: [{ type: "text", text: "hi" }] }));
+		settle();
+		assert.equal(sent.length, 0, "普通消息不触发");
+
+		fireMessage(refusal());
+		settle();
+		assert.deepEqual(sent, [{ content: "/recover", options: { expandPromptTemplates: true } }], "拒答后停稳派发 /recover");
+
+		fireMessage(refusal());
+		settle();
+		assert.equal(sent.length, 1, "冷却内不重复派发");
+
+		delete globalThis[Symbol.for("pi-stall-watchdog:recovery")];
+		fireMessage(refusal());
+		settle({ hasUI: false });
+		assert.equal(sent.length, 1, "无 UI 默认不派发");
+	} finally {
+		if (savedEnv === undefined) delete process.env.PI_STALL_WATCHDOG_RECOVER;
+		else process.env.PI_STALL_WATCHDOG_RECOVER = savedEnv;
+	}
+});
+
+test("恢复命令：新会话带 parentSession，先写接续说明再发「继续上次的任务」", async () => {
+	const commands = {};
+	const fakePi = {
+		on: () => {},
+		registerCommand: (name, options) => { commands[name] = options; },
+		sendUserMessage: () => {},
+	};
+	watchdogExtension(fakePi);
+	assert.ok(commands.recover, "注册了 recover 命令");
+	const calls = [];
+	const rctx = {
+		sendMessage: async (message) => { calls.push(["sendMessage", message]); },
+		sendUserMessage: async (text) => { calls.push(["sendUserMessage", text]); },
+	};
+	const ctx = {
+		waitForIdle: async () => { calls.push(["waitForIdle"]); },
+		sessionManager: { getSessionFile: () => "/tmp/parent-session.jsonl" },
+		newSession: async (options) => {
+			calls.push(["newSession", options.parentSession]);
+			await options.withSession(rctx);
+			return { cancelled: false };
+		},
+	};
+	await commands.recover.handler("", ctx);
+	assert.deepEqual(calls.map((call) => call[0]), ["waitForIdle", "newSession", "sendMessage", "sendUserMessage"]);
+	assert.equal(calls[1][1], "/tmp/parent-session.jsonl");
+	assert.equal(calls[2][1].customType, "stall-watchdog-recovery");
+	assert.equal(calls[2][1].display, true);
+	assert.match(String(calls[2][1].content), /safeguards/);
+	assert.match(String(calls[2][1].content), /parent-session\.jsonl/);
+	assert.equal(calls[3][1], "继续上次的任务");
 });
