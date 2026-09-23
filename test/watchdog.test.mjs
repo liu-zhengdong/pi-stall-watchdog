@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { isRetryableAssistantError } from "@earendil-works/pi-ai/compat";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import watchdogExtension, { RECOVERY_COOLDOWN_MS, buildStallMessage, isSafeguardRefusal, shouldAutoRecover, withStallWatchdog } from "../src/index.ts";
+import { buildTranscript } from "../src/transcript.ts";
 
 // 看门狗的计时器是 unref 的（不该让 pi 进程为它活着），测试进程里没有别的
 // 活动句柄，事件循环会直接排空。真实运行时底层请求自带 socket/子进程句柄，
@@ -242,4 +246,66 @@ test("恢复命令：新会话带 parentSession，先写接续说明再发「继
 	assert.match(String(calls[2][1].content), /safeguards/);
 	assert.match(String(calls[2][1].content), /parent-session\.jsonl/);
 	assert.equal(calls[3][1], "继续上次的任务");
+});
+
+// 2026-09-23 连续三次拦截（reasoning_extraction）都发生在恢复出来的新会话里：
+// 模型自己解析原会话 JSONL，把旧推理打印进了上下文。正文里不能有推理，也不能
+// 有工具输出（里面可能就是之前打印过的推理）。
+const RECOVERY_BRANCH = [
+	{ type: "message", id: "1", message: { role: "user", content: "旧任务，已被压缩" } },
+	{ type: "message", id: "2", message: { role: "user", content: "修一下 #16" } },
+	{ type: "message", id: "3", message: { role: "assistant", content: [
+		{ type: "thinking", thinking: "SECRET-REASONING" },
+		{ type: "text", text: "先读代码。" },
+		{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "cat src/a.ts" } },
+	] } },
+	{ type: "message", id: "4", message: { role: "toolResult", toolCallId: "t1", content: [{ type: "text", text: "SECRET-TOOL-OUTPUT" }] } },
+	{ type: "compaction", id: "5", summary: "之前讨论了 bridge 的问题", firstKeptEntryId: "2" },
+	{ type: "custom_message", id: "6", customType: "note", content: "可见的扩展消息", display: true },
+	{ type: "custom_message", id: "7", customType: "hidden", content: "HIDDEN-EXTENSION", display: false },
+	{ type: "message", id: "8", message: { role: "user", content: [{ type: "text", text: "继续" }, { type: "image", data: "x", mimeType: "image/png" }] } },
+	{ type: "message", id: "9", message: { role: "assistant", content: [{ type: "thinking", thinking: "MORE-REASONING" }], stopReason: "error", errorMessage: "API Error: Opus 5's safeguards flagged this message" } },
+];
+
+test("原会话正文：只留对话，不收推理、工具输出和隐藏的扩展消息", () => {
+	const text = buildTranscript(RECOVERY_BRANCH);
+	for (const kept of ["修一下 #16", "先读代码。", "- 调用 bash", "cat src/a.ts", "之前讨论了 bridge 的问题", "可见的扩展消息", "[图片]", "safeguards flagged"]) {
+		assert.ok(text.includes(kept), `应收录：${kept}`);
+	}
+	for (const dropped of ["SECRET-REASONING", "MORE-REASONING", "SECRET-TOOL-OUTPUT", "HIDDEN-EXTENSION"]) {
+		assert.ok(!text.includes(dropped), `不应收录：${dropped}`);
+	}
+	assert.ok(!text.includes("旧任务，已被压缩"), "压缩掉的部分只留摘要");
+	assert.match(text, /## 最后一条用户消息\n\n继续\n\[图片\]\n\n## 全文/, "最后一条用户消息放在最前面");
+});
+
+test("恢复命令：写出原会话正文，接续说明指向它，并提醒别打印原会话文件", async () => {
+	const home = mkdtempSync(join(tmpdir(), "stall-watchdog-home-"));
+	const savedHome = process.env.HOME;
+	process.env.HOME = home;
+	try {
+		const commands = {};
+		watchdogExtension({ on: () => {}, registerCommand: (name, options) => { commands[name] = options; }, sendUserMessage: () => {} });
+		const sent = [];
+		const ctx = {
+			waitForIdle: async () => {},
+			sessionManager: { getSessionFile: () => "/tmp/sessions/parent-session.jsonl", getBranch: () => RECOVERY_BRANCH },
+			newSession: async (options) => {
+				await options.withSession({ sendMessage: async (message) => { sent.push(message); }, sendUserMessage: async () => {} });
+				return { cancelled: false };
+			},
+		};
+		await commands.recover.handler("", ctx);
+
+		const path = join(home, ".pi", "agent", "stall-watchdog", "recovered", "parent-session.md");
+		const note = String(sent[0].content);
+		assert.ok(note.includes(path), "接续说明指向正文");
+		assert.match(note, /parent-session\.jsonl 含推理内容，不要把它打印进上下文/);
+		const written = readFileSync(path, "utf8");
+		assert.ok(written.includes("修一下 #16"));
+		assert.ok(!written.includes("SECRET-REASONING"));
+	} finally {
+		process.env.HOME = savedHome;
+		rmSync(home, { recursive: true, force: true });
+	}
 });

@@ -34,6 +34,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type BranchEntry, writeTranscript } from "./transcript.ts";
 
 const DEFAULT_STALL_MS = 120_000;
 const WRAPPED = Symbol.for("pi-stall-watchdog:wrapped");
@@ -228,6 +229,10 @@ function patchProvider(ctx: ExtensionContext, providerId: string | undefined): v
 // 结束、会话停住。这里在整轮完全停稳后换一个新会话：写一条接续说明，再发送
 // 「继续上次的任务」，让模型从干净上下文继续。
 //
+// 接续说明指向一份去掉推理和工具输出的原会话正文（transcript.ts），不让新会话
+// 自己去解析原会话 JSONL：那样会把旧推理打印进上下文，而拦截类别正是
+// reasoning_extraction。
+//
 // 环境变量：
 //   PI_STALL_WATCHDOG_RECOVER  默认只对交互会话（hasUI）自动恢复；
 //                              设 1 无 UI 也恢复；设 0 关闭。
@@ -275,6 +280,28 @@ export function shouldAutoRecover(opts: { hasUI: boolean; env: string | undefine
 	return opts.now - opts.lastAt >= RECOVERY_COOLDOWN_MS;
 }
 
+/** 接续说明：指向去掉推理的正文；正文写不出来时退回原会话路径。 */
+export function recoveryNote(parent: string | undefined, transcript: string | undefined): string {
+	const lines = ["上一个会话在 Claude Code 的 safeguards 误拦处中断（多为误报），已在这里继续。"];
+	if (transcript) lines.push(`上一个会话的对话正文在 ${transcript}（不含推理和工具输出）。`);
+	if (parent) {
+		lines.push(transcript
+			? `原会话文件 ${parent} 含推理内容，不要把它打印进上下文。`
+			: `原会话文件保留在 ${parent}。它含推理内容，只取用户消息和助手文字，不要打印 thinking。`);
+	}
+	return lines.join("\n");
+}
+
+/** 写原会话正文。写不出来不拦恢复：只是说明里少一个路径。 */
+function saveTranscript(ctx: ExtensionCommandContext, parent: string | undefined): string | undefined {
+	try {
+		return writeTranscript(ctx.sessionManager.getBranch() as BranchEntry[], parent);
+	} catch (error) {
+		log(`transcript write failed: ${String(error)}`);
+		return undefined;
+	}
+}
+
 /** 拒答恢复的注册：检测（message_end）、派发（agent_settled）与命令本体。 */
 function installRefusalRecovery(pi: ExtensionAPI): void {
 	pi.on("message_end", (event: { message?: any }) => {
@@ -306,9 +333,7 @@ function installRefusalRecovery(pi: ExtensionAPI): void {
 		handler: async (_args: unknown, ctx: ExtensionCommandContext) => {
 			await ctx.waitForIdle();
 			const parent = ctx.sessionManager.getSessionFile();
-			const note = parent
-				? `上一个会话在 Claude Code 的 safeguards 误拦处中断（多为误报），已在这里继续。\n原会话文件保留在 ${parent}。`
-				: "上一个会话在 Claude Code 的 safeguards 误拦处中断（多为误报），已在这里继续。";
+			const note = recoveryNote(parent, saveTranscript(ctx, parent));
 			await ctx.newSession({
 				...(parent ? { parentSession: parent } : {}),
 				withSession: async (rctx) => {
